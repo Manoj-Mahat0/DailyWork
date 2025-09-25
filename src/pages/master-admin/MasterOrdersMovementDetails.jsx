@@ -1,0 +1,1379 @@
+import React, { useEffect, useState, useMemo, useRef } from "react";
+import { useParams, useNavigate, useLocation } from "react-router-dom";
+import MasterAdminSidebar from "../../components/MasterAdminSidebar";
+import { useAuth } from "../../context/AuthContext";
+import { useToast } from "../../components/Toast";
+import { API_BASE, API_HOST } from "../../lib/config";
+import {
+    FiSearch,
+    FiDownload,
+    FiClipboard,
+    FiEdit2,
+    FiX,
+    FiPlus,
+    FiTrash2,
+    FiPackage,
+    FiCalendar,
+    FiUser,
+    FiTruck,
+    FiDollarSign,
+    FiShoppingCart,
+    FiEye,
+    FiEyeOff,
+    FiInfo,
+    FiClock,
+    FiMapPin,
+    FiPhone,
+    FiMail
+} from "react-icons/fi";
+
+/**
+ * MasterOrdersMovementDetails - Modern UI Version
+ *
+ * - Loads orders (/orders/all), users (/users/), and products-with-stock (/products-with-stock/products)
+ * - Shows one order details (by route id or query ?order=)
+ * - Vendor previous orders drawer (GET /orders/vendor/:vendorId)
+ * - Admin Edit Items modal (PATCH /orders/:id/items)
+ *
+ * Note: this component keeps hook order stable.
+ */
+
+function StatusBadge({ status }) {
+    const map = {
+        placed: { bg: "bg-gradient-to-r from-indigo-500 to-purple-600", text: "text-white", dot: "bg-white" },
+        confirmed: { bg: "bg-gradient-to-r from-blue-500 to-cyan-600", text: "text-white", dot: "bg-white" },
+        processing: { bg: "bg-gradient-to-r from-yellow-500 to-orange-500", text: "text-white", dot: "bg-white" },
+        shipped: { bg: "bg-gradient-to-r from-orange-500 to-red-500", text: "text-white", dot: "bg-white" },
+        received: { bg: "bg-gradient-to-r from-green-500 to-emerald-600", text: "text-white", dot: "bg-white" },
+        cancelled: { bg: "bg-gradient-to-r from-red-500 to-pink-600", text: "text-white", dot: "bg-white" },
+        returned: { bg: "bg-gradient-to-r from-red-600 to-rose-700", text: "text-white", dot: "bg-white" },
+    };
+    const config = map[String(status || "").toLowerCase()] || { bg: "bg-gray-100", text: "text-gray-700", dot: "bg-gray-400" };
+    const label = String(status || "").replaceAll("_", " ").toUpperCase();
+    
+    return (
+        <span className={`inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold rounded-full ${config.bg} ${config.text} shadow-lg`}>
+            <span className={`w-2 h-2 rounded-full ${config.dot} animate-pulse`}></span>
+            {label}
+        </span>
+    );
+}
+
+function useQuery() {
+    const { search } = useLocation();
+    return new URLSearchParams(search);
+}
+
+function fmtCurrency(val) {
+    const num = Number(val ?? 0);
+    try {
+        return new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 2 }).format(num);
+    } catch {
+        return `₹${num.toFixed(2)}`;
+    }
+}
+
+function fmtDate(d) {
+    if (!d) return "-";
+    try {
+        return new Date(d).toLocaleString("en-IN");
+    } catch {
+        return d;
+    }
+}
+
+// --- STOCK HELPERS ---
+function getProductStock(p) {
+    if (!p) return 0;
+    return Number(
+        p.stocklevel_quantity ??
+        p.stock ??
+        p.available_qty ??
+        p.available ??
+        p.quantity ??
+        p.qty ??
+        p.count ??
+        p.in_stock ??
+        0
+    );
+}
+
+function stockLevelClass(stock) {
+    if (stock <= 0) return { bg: "bg-red-500", ring: "ring-red-200", text: "text-red-700" };
+    if (stock <= 5) return { bg: "bg-orange-500", ring: "ring-orange-200", text: "text-orange-700" };
+    if (stock <= 19) return { bg: "bg-yellow-500", ring: "ring-yellow-200", text: "text-yellow-700" };
+    if (stock <= 49) return { bg: "bg-blue-500", ring: "ring-blue-200", text: "text-blue-700" };
+    if (stock <= 99) return { bg: "bg-green-500", ring: "ring-green-200", text: "text-green-700" };
+    return { bg: "bg-emerald-500", ring: "ring-emerald-200", text: "text-emerald-700" };
+}
+
+// Modern Stock Indicator Component
+function StockIndicator({ stock, size = "md" }) {
+    const config = stockLevelClass(stock);
+    const sizeClasses = {
+        sm: "w-3 h-3",
+        md: "w-4 h-4",
+        lg: "w-6 h-6"
+    };
+    
+    return (
+        <div className="flex items-center gap-2">
+            <div className={`${sizeClasses[size]} ${config.bg} rounded-full ${config.ring} ring-2 shadow-sm`} />
+            <span className={`text-sm font-medium ${config.text}`}>{stock}</span>
+        </div>
+    );
+}
+
+export default function MasterOrdersMovementDetails() {
+    const { id: routeId } = useParams();
+    const query = useQuery();
+    const queryOrderId = query.get("order");
+    const { token } = useAuth();
+    const toast = useToast();
+    const navigate = useNavigate();
+    const mountedRef = useRef(true);
+
+    // --- hooks (keep order stable) ---
+    const [order, setOrder] = useState(null);
+    const [users, setUsers] = useState([]);
+    const [products, setProducts] = useState([]);
+    const [loading, setLoading] = useState(true);
+
+    const [vendorOrders, setVendorOrders] = useState([]);
+    const [vendorOrdersOpen, setVendorOrdersOpen] = useState(false);
+    const [vendorOrdersLoading, setVendorOrdersLoading] = useState(false);
+    const [vendorSearch, setVendorSearch] = useState("");
+
+    // Admin edit modal
+    const [editOpen, setEditOpen] = useState(false);
+    const [editRows, setEditRows] = useState([]);
+    const [editReason, setEditReason] = useState("");
+    const [editSaving, setEditSaving] = useState(false);
+    const [editErrors, setEditErrors] = useState({});
+
+    const [refreshKey, setRefreshKey] = useState(0);
+    const [confirming, setConfirming] = useState(false);
+    const [expandedVendorOrder, setExpandedVendorOrder] = useState(null);
+    const [expandedProductId, setExpandedProductId] = useState(null);
+    const [productDetailsMap, setProductDetailsMap] = useState({});
+    const [batchesMap, setBatchesMap] = useState({});
+
+    // --- API helper ---
+    async function apiRequest(path, opts = {}) {
+        const headers = { Accept: "application/json" };
+        if (token) headers["Authorization"] = `Bearer ${token}`;
+        const fetchOpts = { method: opts.method || "GET", headers };
+        if (opts.body != null) {
+            if (!(opts.body instanceof FormData)) {
+                headers["Content-Type"] = "application/json";
+                fetchOpts.body = JSON.stringify(opts.body);
+            } else {
+                fetchOpts.body = opts.body;
+            }
+        }
+        const res = await fetch(`${API_HOST}${API_BASE}${path}`, fetchOpts);
+        const text = await res.text();
+        let data = null;
+        try {
+            data = text ? JSON.parse(text) : null;
+        } catch {
+            data = text;
+        }
+        if (!res.ok) {
+            const msg = (data && (data.detail || data.message || data.error)) || (typeof data === "string" ? data : `Request failed: ${res.status}`);
+            const err = new Error(msg);
+            err.status = res.status;
+            err.raw = data;
+            throw err;
+        }
+        return data;
+    }
+
+    async function fetchBatches(productId) {
+        if (batchesMap[productId]) return;
+        try {
+            const data = await apiRequest(`/products-with-stock/stock/batches/${productId}`);
+            setBatchesMap(m => ({ ...m, [productId]: Array.isArray(data) ? data : [data] }));
+        } catch (e) {
+            console.error("batches load", e);
+            setBatchesMap(m => ({ ...m, [productId]: [] }));
+        }
+    }
+
+    async function fetchProductDetails(productId) {
+        if (!productId) return null;
+        if (productDetailsMap[productId]) return productDetailsMap[productId];
+        try {
+            const data = await apiRequest(`/products-with-stock/products/${productId}`);
+            setProductDetailsMap((m) => ({ ...m, [productId]: data }));
+            return data;
+        } catch (err) {
+            console.warn("fetchProductDetails", err);
+            return null;
+        }
+    }
+
+    function stockExpiryColor(product) {
+        const stock = getProductStock(product);
+        const batches = Array.isArray(product?.batches) ? product.batches : [];
+        let nearestDays = Infinity;
+        const now = new Date();
+        
+        batches.forEach((b) => {
+            if (b && b.expire_date) {
+                const d = new Date(b.expire_date);
+                const diffDays = Math.ceil((d - now) / (1000 * 60 * 60 * 24));
+                if (diffDays < nearestDays) nearestDays = diffDays;
+            }
+        });
+
+        if (Number.isFinite(nearestDays) && nearestDays <= 7) return { className: "bg-red-500", reason: `Expires in ${nearestDays} day(s)` };
+        if (Number.isFinite(nearestDays) && nearestDays <= 30) return { className: "bg-orange-500", reason: `Expires in ${nearestDays} day(s)` };
+
+        const stockConfig = stockLevelClass(stock);
+        return { className: stockConfig.bg, reason: `Stock: ${stock}` };
+    }
+
+    // --- initial load ---
+    useEffect(() => {
+        mountedRef.current = true;
+        (async () => {
+            try {
+                setLoading(true);
+                const [ordersData, usersData, productsData] = await Promise.all([
+                    apiRequest("/orders/all?limit=500&offset=0"),
+                    apiRequest("/users/"),
+                    apiRequest("/products-with-stock/products"),
+                ]);
+                if (!mountedRef.current) return;
+                setUsers(Array.isArray(usersData) ? usersData : []);
+                setProducts(Array.isArray(productsData) ? productsData : []);
+
+                const ordersArray = Array.isArray(ordersData) ? ordersData : [];
+                let found = null;
+                if (queryOrderId) found = ordersArray.find((o) => Number(o?.id) === Number(queryOrderId));
+                if (!found && routeId) found = ordersArray.find((o) => Number(o?.id) === Number(routeId));
+                if (!found && routeId) found = ordersArray.find((o) => Number(o?.vendor_id) === Number(routeId) || Number(o?.customer_id) === Number(routeId));
+                setOrder(found || null);
+            } catch (err) {
+                console.error("load error", err);
+                toast(err.message || "Failed to load data", "error");
+            } finally {
+                if (mountedRef.current) setLoading(false);
+            }
+        })();
+        return () => { mountedRef.current = false; };
+    }, [routeId, queryOrderId, token, refreshKey]);
+
+    // maps for quick lookup
+    const usersMap = useMemo(() => {
+        const m = {};
+        (users || []).forEach((u) => { if (u && typeof u.id !== "undefined") m[u.id] = u; });
+        return m;
+    }, [users]);
+
+    const productsMap = useMemo(() => {
+        const m = {};
+        (products || []).forEach((p) => { if (p && typeof p.id !== "undefined") m[p.id] = p; });
+        return m;
+    }, [products]);
+
+    const vendorId = (order && (order.vendor_id ?? order.customer_id)) ?? null;
+    const vendorUser = vendorId ? usersMap[vendorId] : null;
+    const customer = usersMap ? usersMap[order?.customer_id] : null;
+
+    // load vendor previous orders
+    useEffect(() => {
+        let cancelled = false;
+        (async () => {
+            if (!vendorId) { setVendorOrders([]); return; }
+            try {
+                setVendorOrdersLoading(true);
+                const data = await apiRequest(`/orders/vendor/${vendorId}?limit=100&offset=0`);
+                if (cancelled) return;
+                setVendorOrders(Array.isArray(data) ? data : []);
+            } catch (err) {
+                console.warn("vendor orders load", err);
+                setVendorOrders([]);
+            } finally {
+                if (!cancelled) setVendorOrdersLoading(false);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [vendorId, token]);
+
+    // order totals
+    const totals = useMemo(() => {
+        if (!order || !Array.isArray(order.items)) return { qty: 0, subtotal: 0 };
+        let qty = 0, subtotal = 0;
+        order.items.forEach((it) => {
+            const q = Number(it.final_qty ?? it.original_qty ?? 0);
+            const u = Number(it.unit_price ?? 0);
+            qty += q;
+            subtotal += Number(it.subtotal ?? u * q);
+        });
+        return { qty, subtotal };
+    }, [order]);
+
+    // --- Confirm order ---
+    async function confirmOrder() {
+        if (!order) return;
+        try {
+            setConfirming(true);
+            const res = await apiRequest(`/orders/${order.id}/confirm`, { method: "POST", body: "" });
+            const newStatus = res?.status || "confirmed";
+            const returnedId = res?.order_id ?? order.id;
+            setOrder((o) => ({ ...o, status: newStatus, id: returnedId }));
+            toast(`Order ${returnedId} ${newStatus}`, "success");
+        } catch (err) {
+            console.error("confirm err", err);
+            toast(err.message || "Failed to confirm", "error");
+        } finally {
+            setConfirming(false);
+        }
+    }
+
+    // --- Admin edit modal helpers ---
+    function openEditModal() {
+        if (!order) return;
+        const rows = (order.items || []).map((it) => ({
+            id: it.id,
+            product_id: it.product_id,
+            qty: Number(it.final_qty ?? it.original_qty ?? 0),
+            unit_price: Number(it.unit_price ?? 0),
+            tempId: `r-${it.id}`,
+        }));
+        setEditRows(rows);
+        setEditReason("");
+        setEditErrors({});
+        setEditOpen(true);
+    }
+
+    function addEmptyRow() {
+        setEditRows((r) => [...r, { tempId: `t-${Date.now()}-${Math.random()}`, product_id: "", qty: 1, unit_price: 0 }]);
+    }
+
+    function updateRow(idx, patch) {
+        setEditRows((r) => {
+            const copy = [...r];
+            copy[idx] = { ...copy[idx], ...patch };
+            return copy;
+        });
+    }
+
+    function removeRow(idx) {
+        setEditRows((r) => {
+            const copy = [...r];
+            copy.splice(idx, 1);
+            return copy;
+        });
+    }
+
+    // Modern Custom Product Select Component
+    function CustomProductSelect({
+        products,
+        value,
+        onChange,
+        productDetailsMap,
+        getColor,
+        placeholder = "— Select Product —",
+    }) {
+        const [open, setOpen] = useState(false);
+        const ref = useRef(null);
+
+        useEffect(() => {
+            function onDoc(e) {
+                if (!ref.current) return;
+                if (!ref.current.contains(e.target)) setOpen(false);
+            }
+            document.addEventListener("click", onDoc);
+            return () => document.removeEventListener("click", onDoc);
+        }, []);
+
+        const selected = products.find((p) => String(p.id) === String(value)) || null;
+
+        return (
+            <div ref={ref} className="relative w-full">
+                <button
+                    type="button"
+                    onClick={() => setOpen((v) => !v)}
+                    className="w-full text-left px-4 py-3 border border-gray-200 rounded-xl bg-white hover:bg-gray-50 flex items-center justify-between gap-3 transition-all duration-200 focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                >
+                    <div className="min-w-0 truncate text-sm">
+                        {selected ? (
+                            <div className="flex items-center gap-3">
+                                <div className="w-8 h-8 bg-gradient-to-br from-blue-400 to-purple-500 rounded-lg flex items-center justify-center text-white font-semibold text-xs">
+                                    {selected.name?.charAt(0) || 'P'}
+                                </div>
+                                <div>
+                                    <div className="font-medium text-gray-900">{selected.name}</div>
+                                    <div className="text-xs text-gray-500">
+                                        {selected.sku ? `SKU: ${selected.sku}` : `ID: ${selected.id}`}
+                                        {typeof selected.price !== "undefined" ? ` • ₹${selected.price}` : ""}
+                                    </div>
+                                </div>
+                            </div>
+                        ) : (
+                            <span className="text-gray-400">{placeholder}</span>
+                        )}
+                    </div>
+                    <div className="text-gray-400">
+                        <svg className={`w-5 h-5 transition-transform duration-200 ${open ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                        </svg>
+                    </div>
+                </button>
+
+                {open && (
+                    <div className="absolute z-20 mt-2 w-full max-h-64 overflow-auto rounded-xl border border-gray-200 bg-white shadow-xl">
+                        {products.map((p) => {
+                            const details = productDetailsMap?.[p.id] ?? p;
+                            const colorInfo = getColor ? getColor(details) : { className: "bg-gray-100", reason: "" };
+                            return (
+                                <div
+                                    key={p.id}
+                                    role="option"
+                                    onClick={() => { onChange(String(p.id)); setOpen(false); }}
+                                    className="flex items-center gap-3 px-4 py-3 cursor-pointer hover:bg-gray-50 transition-colors duration-150 border-b border-gray-100 last:border-b-0"
+                                    title={colorInfo.reason || ""}
+                                >
+                                    <div className="w-10 h-10 bg-gradient-to-br from-blue-400 to-purple-500 rounded-lg flex items-center justify-center text-white font-semibold text-sm">
+                                        {p.name?.charAt(0) || 'P'}
+                                    </div>
+                                    <div className="flex-1 min-w-0">
+                                        <div className="font-medium text-gray-900 truncate">{p.name}</div>
+                                        <div className="text-sm text-gray-500 truncate">
+                                            {p.sku ? `SKU: ${p.sku}` : `ID: ${p.id}`}
+                                            {typeof p.price !== "undefined" ? ` • ₹${p.price}` : ""}
+                                        </div>
+                                    </div>
+                                    <StockIndicator stock={getProductStock(details)} size="sm" />
+                                </div>
+                            );
+                        })}
+                    </div>
+                )}
+            </div>
+        );
+    }
+
+    function validateEdit() {
+        const errs = {};
+        if (!Array.isArray(editRows) || editRows.length === 0) errs.global = "At least one item required.";
+        editRows.forEach((row, i) => {
+            if (!row.product_id) errs[`row_${i}`] = "Product required";
+            if (!Number.isFinite(Number(row.qty)) || Number(row.qty) <= 0) errs[`row_qty_${i}`] = "Qty must be > 0";
+            if (!Number.isFinite(Number(row.unit_price)) || Number(row.unit_price) < 0) errs[`row_price_${i}`] = "Unit price must be >= 0";
+            const p = productsMap[row.product_id];
+            if (p && typeof p.stocklevel_quantity !== "undefined") {
+                if (Number(row.qty) > Number(p.stocklevel_quantity)) {
+                    errs[`row_qty_${i}`] = `Exceeds stock (${p.stocklevel_quantity})`;
+                }
+            }
+        });
+        setEditErrors(errs);
+        return Object.keys(errs).length === 0;
+    }
+
+    async function submitEdit() {
+        if (!validateEdit()) { toast("Fix validation errors", "error"); return; }
+        if (!order) return;
+        setEditSaving(true);
+        try {
+            const itemsPayload = editRows.map((r) => ({
+                product_id: Number(r.product_id),
+                qty: Number(r.qty),
+                unit_price: Number(r.unit_price),
+            }));
+            const payload = { items: itemsPayload, reason: editReason || "Admin edit" };
+            const res = await apiRequest(`/orders/${order.id}/items`, { method: "PATCH", body: payload });
+            toast(res?.message || res?.status || "Order updated", "success");
+            
+            try {
+                const ordersData = await apiRequest("/orders/all?limit=500&offset=0");
+                const ordersArray = Array.isArray(ordersData) ? ordersData : [];
+                const found = ordersArray.find((o) => Number(o.id) === Number(order.id));
+                setOrder(found || null);
+            } catch (err) {
+                console.warn("refresh after edit failed", err);
+            }
+            setEditOpen(false);
+        } catch (err) {
+            console.error("submitEdit err", err);
+            toast(err.message || "Failed to update items", "error");
+        } finally {
+            setEditSaving(false);
+        }
+    }
+
+    // vendor drawer filtering
+    const filteredVendorOrders = useMemo(() => {
+        if (!vendorSearch) return vendorOrders || [];
+        const s = vendorSearch.trim().toLowerCase();
+        return (vendorOrders || []).filter((o) => {
+            return String(o.id).includes(s) ||
+                String(o.customer_id).includes(s) ||
+                (o.status || "").toLowerCase().includes(s) ||
+                (o.created_at || "").toLowerCase().includes(s);
+        });
+    }, [vendorOrders, vendorSearch]);
+
+    // export order JSON
+    function downloadJSON() {
+        if (!order) return;
+        const blob = new Blob([JSON.stringify(order, null, 2)], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `order-${order.id}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+    }
+
+    // --- render ---
+    if (loading) {
+        return (
+            <div className="min-h-screen flex bg-gradient-to-br from-gray-50 to-gray-100">
+                <MasterAdminSidebar />
+                <main className="flex-1 p-8">
+                    <div className="animate-pulse space-y-6">
+                        <div className="bg-white rounded-2xl shadow-sm p-6">
+                            <div className="h-8 w-1/3 bg-gray-200 rounded-lg mb-4" />
+                            <div className="h-4 w-1/4 bg-gray-200 rounded mb-6" />
+                            <div className="grid grid-cols-3 gap-4">
+                                <div className="h-32 bg-gray-200 rounded-xl" />
+                                <div className="h-32 bg-gray-200 rounded-xl" />
+                                <div className="h-32 bg-gray-200 rounded-xl" />
+                            </div>
+                        </div>
+                    </div>
+                </main>
+            </div>
+        );
+    }
+
+    if (!order) {
+        return (
+            <div className="min-h-screen flex bg-gradient-to-br from-gray-50 to-gray-100">
+                <MasterAdminSidebar />
+                <main className="flex-1 p-8">
+                    <div className="bg-white rounded-2xl shadow-sm p-8 text-center">
+                        <div className="w-16 h-16 bg-gray-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                            <FiPackage className="w-8 h-8 text-gray-400" />
+                        </div>
+                        <h2 className="text-xl font-semibold text-gray-900 mb-2">Order Not Found</h2>
+                        <p className="text-gray-500 mb-6">The order you're looking for doesn't exist or has been removed.</p>
+                        <button 
+                            onClick={() => navigate(-1)} 
+                            className="px-6 py-3 bg-blue-600 text-white rounded-xl hover:bg-blue-700 transition-colors duration-200"
+                        >
+                            Go Back
+                        </button>
+                    </div>
+                </main>
+            </div>
+        );
+    }
+
+    return (
+        <div className="min-h-screen flex bg-gradient-to-br from-gray-50 to-gray-100">
+            <MasterAdminSidebar />
+            <main className="flex-1 p-8">
+                {/* Modern Header Section */}
+                <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-6 mb-8">
+                    <div className="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-6">
+                        <div className="flex items-start gap-4">
+                            <button 
+                                onClick={() => navigate(-1)} 
+                                className="flex items-center gap-2 px-4 py-2 bg-gray-50 hover:bg-gray-100 text-gray-700 rounded-xl border border-gray-200 transition-all duration-200 hover:shadow-sm"
+                            >
+                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 19l-7-7m0 0l7-7m-7 7h18" />
+                                </svg>
+                                Back
+                            </button>
+                            <div>
+                                <div className="flex items-center gap-3 mb-2">
+                                    <h1 className="text-3xl font-bold text-gray-900">
+                                        Order #{order.id}
+                                    </h1>
+                                    <StatusBadge status={order.status} />
+                                </div>
+                                <div className="flex items-center gap-6 text-sm text-gray-500">
+                                    <div className="flex items-center gap-2">
+                                        <FiCalendar className="w-4 h-4" />
+                                        Created: {fmtDate(order.created_at)}
+                                    </div>
+                                    {vendorUser && (
+                                        <div className="flex items-center gap-2">
+                                            <FiUser className="w-4 h-4" />
+                                            Vendor: {vendorUser.name}
+                                        </div>
+                                    )}
+                                    <div className="flex items-center gap-2">
+                                        <FiDollarSign className="w-4 h-4" />
+                                        Total: {fmtCurrency(order.total_amount ?? order.total ?? totals.subtotal)}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div className="flex items-center gap-3">
+                            <button
+                                onClick={confirmOrder}
+                                disabled={confirming || order.status !== "placed"}
+                                className={`flex items-center gap-2 px-6 py-3 rounded-xl font-medium transition-all duration-200 ${
+                                    confirming || order.status !== "placed"
+                                        ? "bg-gray-100 text-gray-400 cursor-not-allowed"
+                                        : "bg-gradient-to-r from-green-500 to-emerald-600 hover:from-green-600 hover:to-emerald-700 text-white shadow-lg hover:shadow-xl"
+                                }`}
+                            >
+                                {confirming ? (
+                                    <>
+                                        <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                                        Confirming...
+                                    </>
+                                ) : (
+                                    <>
+                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                                        </svg>
+                                        Confirm Order
+                                    </>
+                                )}
+                            </button>
+                            
+                            <button
+                                onClick={() => setVendorOrdersOpen(true)}
+                                className="flex items-center gap-2 px-6 py-3 bg-gradient-to-r from-indigo-500 to-purple-600 hover:from-indigo-600 hover:to-purple-700 text-white rounded-xl font-medium transition-all duration-200 shadow-lg hover:shadow-xl"
+                            >
+                                <FiClipboard className="w-4 h-4" />
+                                Previous Orders
+                            </button>
+
+                            <button
+                                onClick={downloadJSON}
+                                className="flex items-center gap-2 px-6 py-3 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-xl font-medium transition-all duration-200"
+                            >
+                                <FiDownload className="w-4 h-4" />
+                                Export
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                {/* Main Content Grid */}
+                <div className="grid grid-cols-1 xl:grid-cols-5 gap-8">
+                    {/* LEFT: Product Batches Panel */}
+                    <div className="xl:col-span-1">
+                        <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-6 sticky top-8">
+                            <div className="flex items-center gap-3 mb-6">
+                                <div className="w-10 h-10 bg-gradient-to-br from-blue-500 to-purple-600 rounded-xl flex items-center justify-center">
+                                    <FiPackage className="w-5 h-5 text-white" />
+                                </div>
+                                <div>
+                                    <h3 className="font-semibold text-gray-900">Product Batches</h3>
+                                    <p className="text-sm text-gray-500">{products.length} products</p>
+                                </div>
+                            </div>
+
+                            <div className="space-y-3 max-h-[70vh] overflow-y-auto pr-2">
+                                {Array.isArray(products) && products.length > 0 ? (
+                                    products.map((p) => {
+                                        const pid = p.id;
+                                        const isExpanded = expandedProductId === pid;
+                                        const stockQty = typeof p.stocklevel_quantity !== "undefined" ? p.stocklevel_quantity : getProductStock(p);
+                                        const batches = batchesMap[pid] ?? null;
+
+                                        return (
+                                            <div key={pid} className="border border-gray-200 rounded-xl p-4 bg-gradient-to-r from-gray-50 to-white hover:shadow-sm transition-all duration-200">
+                                                <div className="flex items-center justify-between gap-3 mb-3">
+                                                    <div className="flex items-center gap-3 min-w-0">
+                                                        <div className="w-8 h-8 bg-gradient-to-br from-blue-400 to-purple-500 rounded-lg flex items-center justify-center text-white font-semibold text-xs">
+                                                            {p.name?.charAt(0) || 'P'}
+                                                        </div>
+                                                        <div className="min-w-0">
+                                                            <div className="font-medium text-gray-900 truncate">{p.name}</div>
+                                                            <div className="text-xs text-gray-500">ID: {pid}</div>
+                                                        </div>
+                                                    </div>
+                                                    <StockIndicator stock={stockQty} size="sm" />
+                                                </div>
+
+                                                <button
+                                                    onClick={async () => {
+                                                        if (isExpanded) {
+                                                            setExpandedProductId(null);
+                                                            return;
+                                                        }
+                                                        setExpandedProductId(pid);
+                                                        await fetchBatches(pid);
+                                                    }}
+                                                    className="w-full flex items-center justify-center gap-2 px-3 py-2 text-sm border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors duration-150"
+                                                >
+                                                    {isExpanded ? <FiEyeOff className="w-4 h-4" /> : <FiEye className="w-4 h-4" />}
+                                                    {isExpanded ? "Hide Batches" : "Show Batches"}
+                                                </button>
+
+                                                {isExpanded && (
+                                                    <div className="mt-3 space-y-2">
+                                                        {batches === null ? (
+                                                            <div className="flex items-center justify-center py-4 text-sm text-gray-500">
+                                                                <div className="w-4 h-4 border-2 border-gray-300 border-t-blue-500 rounded-full animate-spin mr-2"></div>
+                                                                Loading batches...
+                                                            </div>
+                                                        ) : batches.length === 0 ? (
+                                                            <div className="text-center py-4 text-sm text-gray-500">
+                                                                <FiInfo className="w-4 h-4 mx-auto mb-1" />
+                                                                No batch data available
+                                                            </div>
+                                                        ) : (
+                                                            batches.map((b) => (
+                                                                <div key={b.id ?? b.batch_no ?? `${pid}-${Math.random()}`} className="bg-white rounded-lg p-3 border border-gray-100 shadow-sm">
+                                                                    <div className="flex items-center justify-between mb-2">
+                                                                        <div className="font-medium text-sm text-gray-900">
+                                                                            Batch: {b.batch_no || "-"}
+                                                                        </div>
+                                                                        <div className="px-2 py-1 bg-blue-50 text-blue-700 rounded-full text-xs font-medium">
+                                                                            Qty: {b.quantity ?? "-"}
+                                                                        </div>
+                                                                    </div>
+                                                                    <div className="grid grid-cols-2 gap-2 text-xs text-gray-500">
+                                                                        <div className="flex items-center gap-1">
+                                                                            <FiCalendar className="w-3 h-3" />
+                                                                            {fmtDate(b.expire_date)}
+                                                                        </div>
+                                                                        <div className="flex items-center gap-1">
+                                                                            <FiClock className="w-3 h-3" />
+                                                                            {fmtDate(b.added_at ?? b.added)}
+                                                                        </div>
+                                                                    </div>
+                                                                </div>
+                                                            ))
+                                                        )}
+                                                    </div>
+                                                )}
+                                            </div>
+                                        );
+                                    })
+                                ) : (
+                                    <div className="text-center py-8 text-gray-500">
+                                        <FiPackage className="w-8 h-8 mx-auto mb-2 text-gray-300" />
+                                        <p className="text-sm">No products available</p>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* MIDDLE: Order Items */}
+                    <div className="xl:col-span-3">
+                        <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-6">
+                            <div className="flex items-center justify-between mb-6">
+                                <div className="flex items-center gap-3">
+                                    <div className="w-10 h-10 bg-gradient-to-br from-green-500 to-emerald-600 rounded-xl flex items-center justify-center">
+                                        <FiShoppingCart className="w-5 h-5 text-white" />
+                                    </div>
+                                    <div>
+                                        <h2 className="text-xl font-semibold text-gray-900">Order Items</h2>
+                                        <p className="text-sm text-gray-500">{order.items?.length || 0} items • Total qty: {totals.qty}</p>
+                                    </div>
+                                </div>
+                                <button 
+                                    onClick={openEditModal} 
+                                    className="flex items-center gap-2 px-6 py-3 bg-gradient-to-r from-blue-500 to-indigo-600 hover:from-blue-600 hover:to-indigo-700 text-white rounded-xl font-medium transition-all duration-200 shadow-lg hover:shadow-xl"
+                                >
+                                    <FiEdit2 className="w-4 h-4" />
+                                    Edit Items
+                                </button>
+                            </div>
+
+                            {Array.isArray(order.items) && order.items.length > 0 ? (
+                                <div className="space-y-4">
+                                    {order.items.map((it) => {
+                                        const prod = productsMap[it.product_id];
+                                        const qty = Number(it.final_qty ?? it.original_qty ?? 0);
+                                        const unit = Number(it.unit_price ?? 0);
+                                        const subtotal = Number(it.subtotal ?? unit * qty);
+                                        const stock = getProductStock(prod);
+                                        const stockConfig = stockLevelClass(stock);
+
+                                        const imgUrl = prod?.image || prod?.image_url;
+                                        const imgSrc = imgUrl ? (String(imgUrl).startsWith("http") ? String(imgUrl) : `${API_HOST}${String(imgUrl)}`) : null;
+
+                                        return (
+                                            <div key={it.id} className="flex items-center gap-4 bg-gradient-to-r from-gray-50 to-white p-4 rounded-xl border border-gray-200 hover:shadow-sm transition-all duration-200">
+                                                <div className="w-16 h-16 shrink-0">
+                                                    {imgSrc ? (
+                                                        <img src={imgSrc} alt={prod?.name} className="w-16 h-16 object-cover rounded-xl shadow-sm" />
+                                                    ) : (
+                                                        <div className="w-16 h-16 bg-gradient-to-br from-gray-200 to-gray-300 rounded-xl flex items-center justify-center">
+                                                            <FiPackage className="w-6 h-6 text-gray-500" />
+                                                        </div>
+                                                    )}
+                                                </div>
+
+                                                <div className="flex-1 min-w-0">
+                                                    <div className="flex items-start justify-between">
+                                                        <div>
+                                                            <div className="flex items-center gap-3 mb-1">
+                                                                <h3 className="font-semibold text-gray-900">{prod ? prod.name : `Product #${it.product_id}`}</h3>
+                                                                <StockIndicator stock={stock} size="sm" />
+                                                            </div>
+                                                            <div className="text-sm text-gray-500 mb-2">
+                                                                {prod?.sku ? `SKU: ${prod.sku}` : `ID: ${it.product_id}`}
+                                                                {prod && (
+                                                                    <span className="ml-3 px-2 py-1 bg-gray-100 rounded-full text-xs">
+                                                                        Stock: {typeof prod.stocklevel_quantity !== "undefined" ? prod.stocklevel_quantity : stock}
+                                                                    </span>
+                                                                )}
+                                                            </div>
+                                                            <div className="text-xs text-gray-400">Item ID: {it.id}</div>
+                                                        </div>
+
+                                                        <div className="text-right">
+                                                            <div className="text-lg font-bold text-gray-900 mb-1">{fmtCurrency(subtotal)}</div>
+                                                            <div className="text-sm text-gray-500">
+                                                                {qty} × {fmtCurrency(unit)}
+                                                            </div>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            ) : (
+                                <div className="text-center py-12">
+                                    <div className="w-16 h-16 bg-gray-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                                        <FiShoppingCart className="w-8 h-8 text-gray-400" />
+                                    </div>
+                                    <h3 className="text-lg font-medium text-gray-900 mb-2">No Items</h3>
+                                    <p className="text-gray-500">This order doesn't have any items yet.</p>
+                                </div>
+                            )}
+
+                            {/* Order Total */}
+                            <div className="mt-6 pt-6 border-t border-gray-200">
+                                <div className="flex items-center justify-between">
+                                    <div className="text-lg font-medium text-gray-900">Order Total</div>
+                                    <div className="text-3xl font-bold bg-gradient-to-r from-green-600 to-emerald-600 bg-clip-text text-transparent">
+                                        {fmtCurrency(order.total_amount ?? order.total ?? totals.subtotal)}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* RIGHT: Vendor & Customer Info */}
+                    <div className="xl:col-span-1">
+                        <div className="space-y-6">
+                            {/* Vendor Info */}
+                            {vendorUser && (
+                                <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-6">
+                                    <div className="flex items-center gap-3 mb-4">
+                                        <div className="w-10 h-10 bg-gradient-to-br from-purple-500 to-pink-600 rounded-xl flex items-center justify-center">
+                                            <FiUser className="w-5 h-5 text-white" />
+                                        </div>
+                                        <div>
+                                            <h3 className="font-semibold text-gray-900">Vendor</h3>
+                                            <p className="text-sm text-gray-500">ID: {vendorId}</p>
+                                        </div>
+                                    </div>
+                                    <div className="space-y-3">
+                                        <div>
+                                            <div className="text-sm font-medium text-gray-700">Name</div>
+                                            <div className="text-gray-900">{vendorUser.name}</div>
+                                        </div>
+                                        {vendorUser.email && (
+                                            <div>
+                                                <div className="text-sm font-medium text-gray-700">Email</div>
+                                                <div className="text-gray-900 text-sm">{vendorUser.email}</div>
+                                            </div>
+                                        )}
+                                        {vendorUser.phone && (
+                                            <div>
+                                                <div className="text-sm font-medium text-gray-700">Phone</div>
+                                                <div className="text-gray-900 text-sm">{vendorUser.phone}</div>
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Customer Info */}
+                            {customer && (
+                                <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-6">
+                                    <div className="flex items-center gap-3 mb-4">
+                                        <div className="w-10 h-10 bg-gradient-to-br from-blue-500 to-cyan-600 rounded-xl flex items-center justify-center">
+                                            <FiUser className="w-5 h-5 text-white" />
+                                        </div>
+                                        <div>
+                                            <h3 className="font-semibold text-gray-900">Customer</h3>
+                                            <p className="text-sm text-gray-500">ID: {customer.id}</p>
+                                        </div>
+                                    </div>
+                                    <div className="space-y-3">
+                                        <div>
+                                            <div className="text-sm font-medium text-gray-700">Name</div>
+                                            <div className="text-gray-900">{customer.name}</div>
+                                        </div>
+                                        {customer.email && (
+                                            <div>
+                                                <div className="text-sm font-medium text-gray-700">Email</div>
+                                                <div className="text-gray-900 text-sm">{customer.email}</div>
+                                            </div>
+                                        )}
+                                        {customer.phone && (
+                                            <div>
+                                                <div className="text-sm font-medium text-gray-700">Phone</div>
+                                                <div className="text-gray-900 text-sm">{customer.phone}</div>
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Order Timeline */}
+                            <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-6">
+                                <div className="flex items-center gap-3 mb-4">
+                                    <div className="w-10 h-10 bg-gradient-to-br from-orange-500 to-red-600 rounded-xl flex items-center justify-center">
+                                        <FiClock className="w-5 h-5 text-white" />
+                                    </div>
+                                    <div>
+                                        <h3 className="font-semibold text-gray-900">Order Timeline</h3>
+                                        <p className="text-sm text-gray-500">Status history</p>
+                                    </div>
+                                </div>
+                                <div className="space-y-4">
+                                    <div className="flex items-center gap-3">
+                                        <div className="w-3 h-3 bg-green-500 rounded-full"></div>
+                                        <div>
+                                            <div className="text-sm font-medium text-gray-900">Order Created</div>
+                                            <div className="text-xs text-gray-500">{fmtDate(order.created_at)}</div>
+                                        </div>
+                                    </div>
+                                    {order.status !== "placed" && (
+                                        <div className="flex items-center gap-3">
+                                            <div className="w-3 h-3 bg-blue-500 rounded-full"></div>
+                                            <div>
+                                                <div className="text-sm font-medium text-gray-900">Status: {order.status}</div>
+                                                <div className="text-xs text-gray-500">{fmtDate(order.updated_at || order.created_at)}</div>
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                {/* Vendor Previous Orders Drawer */}
+                {vendorOrdersOpen && (
+                    <div className="fixed inset-0 z-50 flex">
+                        <div
+                            className="absolute inset-0 bg-black/40 backdrop-blur-sm"
+                            onClick={() => setVendorOrdersOpen(false)}
+                        />
+                        <div className="relative ml-auto w-full max-w-2xl h-full bg-white shadow-2xl overflow-hidden">
+                            {/* Header */}
+                            <div className="bg-gradient-to-r from-indigo-500 to-purple-600 p-6">
+                                <div className="flex items-center justify-between">
+                                    <div className="text-white">
+                                        <h3 className="text-xl font-semibold">Previous Orders</h3>
+                                        <p className="text-indigo-100 mt-1">
+                                            {vendorUser?.name ? `${vendorUser.name} • ` : ""}Vendor #{vendorId}
+                                        </p>
+                                    </div>
+                                    <button 
+                                        onClick={() => setVendorOrdersOpen(false)} 
+                                        className="p-2 rounded-xl hover:bg-white/10 text-white transition-colors duration-200"
+                                    >
+                                        <FiX className="w-6 h-6" />
+                                    </button>
+                                </div>
+                                
+                                {/* Search */}
+                                <div className="mt-4 relative">
+                                    <FiSearch className="absolute top-1/2 left-4 -translate-y-1/2 text-gray-400" />
+                                    <input
+                                        value={vendorSearch}
+                                        onChange={(e) => setVendorSearch(e.target.value)}
+                                        placeholder="Search orders..."
+                                        className="w-full pl-12 pr-4 py-3 bg-white/10 border border-white/20 rounded-xl text-white placeholder-white/60 focus:bg-white/20 focus:outline-none focus:ring-2 focus:ring-white/30"
+                                    />
+                                </div>
+                            </div>
+
+                            {/* Content */}
+                            <div className="p-6 h-full overflow-y-auto">
+                                {vendorOrdersLoading ? (
+                                    <div className="flex items-center justify-center py-12">
+                                        <div className="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin"></div>
+                                    </div>
+                                ) : filteredVendorOrders.length === 0 ? (
+                                    <div className="text-center py-12">
+                                        <div className="w-16 h-16 bg-gray-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                                            <FiClipboard className="w-8 h-8 text-gray-400" />
+                                        </div>
+                                        <h3 className="text-lg font-medium text-gray-900 mb-2">No Previous Orders</h3>
+                                        <p className="text-gray-500">This vendor doesn't have any previous orders.</p>
+                                    </div>
+                                ) : (
+                                    <div className="space-y-4">
+                                        {filteredVendorOrders
+                                            .filter((o) => o.id !== order.id)
+                                            .map((o) => {
+                                                const isExpanded = expandedVendorOrder === o.id;
+                                                return (
+                                                    <div
+                                                        key={o.id}
+                                                        className="bg-white border border-gray-200 rounded-xl p-4 hover:shadow-sm transition-all duration-200"
+                                                    >
+                                                        <div className="flex items-start justify-between gap-4">
+                                                            <div className="flex-1 min-w-0">
+                                                                <div className="flex items-center gap-3 mb-2">
+                                                                    <h4 className="font-semibold text-gray-900">Order #{o.id}</h4>
+                                                                    <StatusBadge status={o.status} />
+                                                                </div>
+                                                                <div className="text-sm text-gray-500 mb-2">
+                                                                    {fmtDate(o.created_at)}
+                                                                </div>
+                                                                <div className="text-lg font-semibold text-gray-900">
+                                                                    {fmtCurrency(o.total_amount ?? o.total ?? 0)}
+                                                                </div>
+                                                            </div>
+                                                            <button
+                                                                onClick={() => setExpandedVendorOrder(isExpanded ? null : o.id)}
+                                                                className="flex items-center gap-2 px-3 py-2 text-sm border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors duration-150"
+                                                            >
+                                                                {isExpanded ? <FiEyeOff className="w-4 h-4" /> : <FiEye className="w-4 h-4" />}
+                                                                {isExpanded ? "Hide" : "Details"}
+                                                            </button>
+                                                        </div>
+
+                                                        {isExpanded && (
+                                                            <div className="mt-4 pt-4 border-t border-gray-100">
+                                                                {Array.isArray(o.items) && o.items.length > 0 ? (
+                                                                    <div className="space-y-3">
+                                                                        {o.items.map((it) => {
+                                                                            const p = productsMap[it.product_id];
+                                                                            const name = p ? p.name : `Product #${it.product_id}`;
+                                                                            const qty = Number(it.final_qty ?? it.original_qty ?? 0);
+                                                                            const unit = Number(it.unit_price ?? 0);
+                                                                            const subtotal = Number(it.subtotal ?? qty * unit);
+
+                                                                            return (
+                                                                                <div key={it.id} className="flex items-center gap-3 bg-gray-50 rounded-lg p-3">
+                                                                                    <div className="w-8 h-8 bg-gradient-to-br from-blue-400 to-purple-500 rounded-lg flex items-center justify-center text-white font-semibold text-xs">
+                                                                                        {name.charAt(0)}
+                                                                                    </div>
+                                                                                    <div className="flex-1 min-w-0">
+                                                                                        <div className="font-medium text-gray-900 truncate">{name}</div>
+                                                                                        <div className="text-sm text-gray-500">
+                                                                                            {qty} × {fmtCurrency(unit)}
+                                                                                        </div>
+                                                                                    </div>
+                                                                                    <div className="font-semibold text-gray-900">
+                                                                                        {fmtCurrency(subtotal)}
+                                                                                    </div>
+                                                                                </div>
+                                                                            );
+                                                                        })}
+                                                                    </div>
+                                                                ) : (
+                                                                    <div className="text-sm text-gray-500 text-center py-4">No items</div>
+                                                                )}
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                );
+                                            })}
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {/* Admin Edit Items Modal */}
+                {editOpen && (
+                    <div className="fixed inset-0 z-60 flex items-center justify-center px-4 py-6">
+                        <div
+                            className="absolute inset-0 bg-black/50 backdrop-blur-sm"
+                            onClick={() => { if (!editSaving) setEditOpen(false); }}
+                        />
+
+                        <div className="relative bg-white w-full max-w-7xl rounded-2xl shadow-2xl flex flex-col max-h-[90vh] overflow-hidden">
+                            {/* Header */}
+                            <div className="bg-gradient-to-r from-blue-500 to-indigo-600 p-6">
+                                <div className="flex items-center justify-between">
+                                    <div className="text-white">
+                                        <h3 className="text-xl font-semibold">Edit Order Items</h3>
+                                        <p className="text-blue-100 mt-1">Order #{order.id}</p>
+                                    </div>
+                                    <div className="flex items-center gap-3">
+                                        <button
+                                            onClick={addEmptyRow}
+                                            disabled={editSaving}
+                                            className="flex items-center gap-2 px-4 py-2 bg-white/10 hover:bg-white/20 text-white rounded-xl transition-colors duration-200"
+                                        >
+                                            <FiPlus className="w-4 h-4" />
+                                            Add Item
+                                        </button>
+                                        <button
+                                            onClick={() => setEditOpen(false)}
+                                            disabled={editSaving}
+                                            className="p-2 rounded-xl hover:bg-white/10 text-white transition-colors duration-200"
+                                        >
+                                            <FiX className="w-6 h-6" />
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* Body */}
+                            <div className="flex-1 overflow-y-auto p-6">
+                                <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
+                                    {/* LEFT: Product Batches (same as main view) */}
+                                    <div className="lg:col-span-1">
+                                        <div className="bg-gray-50 rounded-xl p-4 sticky top-0">
+                                            <h4 className="font-semibold text-gray-900 mb-4">Product Batches</h4>
+                                            <div className="space-y-3 max-h-[60vh] overflow-y-auto">
+                                                {products.map((p) => {
+                                                    const pid = p.id;
+                                                    const isExpanded = expandedProductId === pid;
+                                                    const stockQty = typeof p.stocklevel_quantity !== "undefined" ? p.stocklevel_quantity : getProductStock(p);
+                                                    const batches = batchesMap[pid] ?? null;
+
+                                                    return (
+                                                        <div key={pid} className="bg-white rounded-lg p-3 border border-gray-200">
+                                                            <div className="flex items-center justify-between gap-2 mb-2">
+                                                                <div className="flex items-center gap-2 min-w-0">
+                                                                    <div className="w-6 h-6 bg-gradient-to-br from-blue-400 to-purple-500 rounded flex items-center justify-center text-white text-xs font-semibold">
+                                                                        {p.name?.charAt(0) || 'P'}
+                                                                    </div>
+                                                                    <div className="min-w-0">
+                                                                        <div className="font-medium text-sm text-gray-900 truncate">{p.name}</div>
+                                                                        <div className="text-xs text-gray-500">ID: {pid}</div>
+                                                                    </div>
+                                                                </div>
+                                                                <StockIndicator stock={stockQty} size="sm" />
+                                                            </div>
+                                                            <button
+                                                                onClick={async () => {
+                                                                    if (isExpanded) {
+                                                                        setExpandedProductId(null);
+                                                                        return;
+                                                                    }
+                                                                    setExpandedProductId(pid);
+                                                                    await fetchBatches(pid);
+                                                                }}
+                                                                className="w-full text-xs px-2 py-1 border border-gray-200 rounded hover:bg-gray-50 transition-colors duration-150"
+                                                            >
+                                                                {isExpanded ? "Hide" : "Show"}
+                                                            </button>
+                                                            {isExpanded && (
+                                                                <div className="mt-2 space-y-1">
+                                                                    {batches === null ? (
+                                                                        <div className="text-xs text-gray-500 text-center py-2">Loading...</div>
+                                                                    ) : batches.length === 0 ? (
+                                                                        <div className="text-xs text-gray-500 text-center py-2">No batches</div>
+                                                                    ) : (
+                                                                        batches.map((b) => (
+                                                                            <div key={b.id ?? b.batch_no ?? `${pid}-${Math.random()}`} className="text-xs bg-gray-50 rounded p-2">
+                                                                                <div className="font-medium">Batch: {b.batch_no || "-"}</div>
+                                                                                <div className="text-gray-500">Qty: {b.quantity ?? "-"} • Exp: {fmtDate(b.expire_date)}</div>
+                                                                            </div>
+                                                                        ))
+                                                                    )}
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    );
+                                                })}
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    {/* RIGHT: Edit Form */}
+                                    <div className="lg:col-span-3">
+                                        {editErrors.global && (
+                                            <div className="mb-4 p-4 rounded-xl bg-red-50 border border-red-200 text-red-700">
+                                                {editErrors.global}
+                                            </div>
+                                        )}
+
+                                        <div className="space-y-4">
+                                            {editRows.map((row, idx) => {
+                                                const prod = productsMap[row.product_id];
+                                                const qty = Number(row.qty || 0);
+                                                const unit = Number(row.unit_price || 0);
+                                                const subtotal = qty * unit;
+                                                const err = editErrors[`row_${idx}`];
+                                                const errQty = editErrors[`row_qty_${idx}`];
+
+                                                const imgUrl = prod?.image || prod?.image_url;
+                                                const imgSrc = imgUrl ? (String(imgUrl).startsWith("http") ? String(imgUrl) : `${API_HOST}${String(imgUrl)}`) : null;
+
+                                                return (
+                                                    <div
+                                                        key={row.id ?? row.tempId ?? idx}
+                                                        className="bg-white border border-gray-200 rounded-xl p-4"
+                                                    >
+                                                        <div className="grid grid-cols-12 gap-4 items-center">
+                                                            {/* Product Select */}
+                                                            <div className="col-span-12 md:col-span-5">
+                                                                <div className="flex gap-3 items-start">
+                                                                    {imgSrc ? (
+                                                                        <img src={imgSrc} alt={prod?.name} className="w-12 h-12 object-cover rounded-lg" />
+                                                                    ) : (
+                                                                        <div className="w-12 h-12 bg-gradient-to-br from-gray-200 to-gray-300 rounded-lg flex items-center justify-center">
+                                                                            <FiPackage className="w-5 h-5 text-gray-500" />
+                                                                        </div>
+                                                                    )}
+                                                                    <div className="flex-1 min-w-0">
+                                                                        <CustomProductSelect
+                                                                            products={products}
+                                                                            value={row.product_id}
+                                                                            onChange={(val) => {
+                                                                                updateRow(idx, { product_id: val });
+                                                                                const basic = products.find((pp) => String(pp.id) === String(val));
+                                                                                if (basic && (basic.price ?? basic.unit_price)) {
+                                                                                    updateRow(idx, { unit_price: basic.price ?? basic.unit_price });
+                                                                                } else {
+                                                                                    updateRow(idx, { unit_price: 0 });
+                                                                                }
+                                                                                fetchProductDetails(val).then((details) => {
+                                                                                    if (details && typeof details.price !== "undefined") {
+                                                                                        updateRow(idx, { unit_price: details.price });
+                                                                                    }
+                                                                                });
+                                                                            }}
+                                                                            productDetailsMap={productDetailsMap}
+                                                                            getColor={(prod) => stockExpiryColor(prod)}
+                                                                        />
+                                                                        {err && <div className="text-xs text-red-600 mt-1">{err}</div>}
+                                                                    </div>
+                                                                </div>
+                                                            </div>
+
+                                                            {/* SKU */}
+                                                            <div className="hidden md:block col-span-2 text-center text-sm text-gray-600">
+                                                                {prod?.sku || `ID: ${prod?.id || "-"}`}
+                                                            </div>
+
+                                                            {/* Stock */}
+                                                            <div className="hidden md:block col-span-2 text-center">
+                                                                <StockIndicator 
+                                                                    stock={typeof prod?.stocklevel_quantity !== "undefined" ? prod.stocklevel_quantity : getProductStock(prod)} 
+                                                                    size="sm" 
+                                                                />
+                                                            </div>
+
+                                                            {/* Qty */}
+                                                            <div className="col-span-6 md:col-span-1">
+                                                                <input
+                                                                    type="number"
+                                                                    min="0"
+                                                                    value={row.qty}
+                                                                    onChange={(e) => {
+                                                                        const v = e.target.value;
+                                                                        if (v === "") updateRow(idx, { qty: "" });
+                                                                        else {
+                                                                            const n = Number(v);
+                                                                            updateRow(idx, { qty: Number.isFinite(n) ? n : 0 });
+                                                                        }
+                                                                    }}
+                                                                    className={`w-full px-3 py-2 border rounded-lg text-sm ${errQty ? "border-red-500" : "border-gray-200"} focus:ring-2 focus:ring-blue-500 focus:border-blue-500`}
+                                                                />
+                                                                {errQty && <div className="text-xs text-red-600 mt-1">{errQty}</div>}
+                                                            </div>
+
+                                                            {/* Unit Price */}
+                                                            <div className="col-span-6 md:col-span-1">
+                                                                <input
+                                                                    type="number"
+                                                                    value={row.unit_price ?? ""}
+                                                                    readOnly
+                                                                    disabled
+                                                                    className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm bg-gray-50 cursor-not-allowed"
+                                                                />
+                                                            </div>
+
+                                                            {/* Subtotal & Remove */}
+                                                            <div className="col-span-12 md:col-span-1 flex flex-col items-end gap-2">
+                                                                <div className="font-semibold text-gray-900">{fmtCurrency(subtotal)}</div>
+                                                                <button
+                                                                    onClick={() => removeRow(idx)}
+                                                                    disabled={editSaving}
+                                                                    className="text-red-600 hover:bg-red-50 p-2 rounded-lg transition-colors duration-150"
+                                                                >
+                                                                    <FiTrash2 className="w-4 h-4" />
+                                                                </button>
+                                                            </div>
+                                                        </div>
+                                                    </div>
+                                                );
+                                            })}
+                                        </div>
+
+                                        {/* Reason */}
+                                        <div className="mt-6">
+                                            <label className="block text-sm font-medium text-gray-700 mb-2">Reason for Changes</label>
+                                            <input
+                                                value={editReason}
+                                                onChange={(e) => setEditReason(e.target.value)}
+                                                placeholder="Enter reason for editing this order..."
+                                                className="w-full px-4 py-3 border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                                            />
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* Footer */}
+                            <div className="bg-gray-50 px-6 py-4 border-t border-gray-200">
+                                <div className="flex items-center justify-between">
+                                    <div className="text-sm text-gray-700">
+                                        <div className="font-medium">Total Items: {editRows.length}</div>
+                                        <div className="text-lg font-bold text-green-600 mt-1">
+                                            Preview Total: {fmtCurrency(editRows.reduce((s, r) => s + (Number(r.qty || 0) * Number(r.unit_price || 0)), 0))}
+                                        </div>
+                                    </div>
+                                    <div className="flex gap-3">
+                                        <button
+                                            onClick={() => setEditOpen(false)}
+                                            disabled={editSaving}
+                                            className="px-6 py-3 border border-gray-200 rounded-xl text-gray-700 hover:bg-gray-50 transition-colors duration-200"
+                                        >
+                                            Cancel
+                                        </button>
+                                        <button
+                                            onClick={submitEdit}
+                                            disabled={editSaving}
+                                            className={`px-6 py-3 rounded-xl font-medium transition-all duration-200 ${
+                                                editSaving 
+                                                    ? "bg-gray-400 text-white cursor-not-allowed" 
+                                                    : "bg-gradient-to-r from-blue-500 to-indigo-600 hover:from-blue-600 hover:to-indigo-700 text-white shadow-lg hover:shadow-xl"
+                                            }`}
+                                        >
+                                            {editSaving ? (
+                                                <>
+                                                    <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin mr-2 inline-block"></div>
+                                                    Saving...
+                                                </>
+                                            ) : (
+                                                "Save Changes"
+                                            )}
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                )}
+            </main>
+        </div>
+    );
+}

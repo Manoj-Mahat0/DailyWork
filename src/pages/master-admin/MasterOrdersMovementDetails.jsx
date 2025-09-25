@@ -158,6 +158,13 @@ export default function MasterOrdersMovementDetails() {
     const [productDetailsMap, setProductDetailsMap] = useState({});
     const [batchesMap, setBatchesMap] = useState({});
 
+    // Vehicle selection state
+    const [vehicles, setVehicles] = useState([]);
+    const [selectedVehicle, setSelectedVehicle] = useState(null);
+    const [vehicleModalOpen, setVehicleModalOpen] = useState(false);
+    const [confirmNotes, setConfirmNotes] = useState("");
+    const [loadingVehicles, setLoadingVehicles] = useState(false);
+
     // --- API helper ---
     async function apiRequest(path, opts = {}) {
         const headers = { Accept: "application/json" };
@@ -315,19 +322,73 @@ export default function MasterOrdersMovementDetails() {
         return { qty, subtotal };
     }, [order]);
 
-    // --- Confirm order ---
+    // --- Fetch vehicles ---
+    async function fetchVehicles() {
+        try {
+            setLoadingVehicles(true);
+            const data = await apiRequest("/vehicles/?me_only=true");
+            setVehicles(Array.isArray(data) ? data : []);
+        } catch (err) {
+            console.error("fetch vehicles error", err);
+            toast("Failed to load vehicles", "error");
+            setVehicles([]);
+        } finally {
+            setLoadingVehicles(false);
+        }
+    }
+
+    // Calculate total order weight (assuming each item has weight or using quantity as proxy)
+    const orderWeight = useMemo(() => {
+        if (!order || !Array.isArray(order.items)) return 0;
+        return order.items.reduce((total, item) => {
+            const qty = Number(item.final_qty ?? item.original_qty ?? 0);
+            const prod = productsMap[item.product_id];
+            // Use product weight if available, otherwise assume 1kg per item as fallback
+            const itemWeight = prod?.weight ?? 1; 
+            return total + (qty * itemWeight);
+        }, 0);
+    }, [order, productsMap]);
+
+    // --- Confirm order with vehicle selection ---
     async function confirmOrder() {
         if (!order) return;
+        
+        // Load vehicles and open selection modal
+        await fetchVehicles();
+        setVehicleModalOpen(true);
+    }
+
+    // --- Actually confirm order with selected vehicle ---
+    async function confirmOrderWithVehicle() {
+        if (!order || !selectedVehicle) return;
+        
         try {
             setConfirming(true);
-            const res = await apiRequest(`/orders/${order.id}/confirm`, { method: "POST", body: "" });
+            const payload = {
+                vehicle_id: selectedVehicle.id,
+                notes: confirmNotes || "Order confirmed"
+            };
+            
+            const res = await apiRequest(`/orders/${order.id}/confirm`, { 
+                method: "POST", 
+                body: payload 
+            });
+            
             const newStatus = res?.status || "confirmed";
             const returnedId = res?.order_id ?? order.id;
-            setOrder((o) => ({ ...o, status: newStatus, id: returnedId }));
-            toast(`Order ${returnedId} ${newStatus}`, "success");
+            const vehicleId = res?.vehicle_id;
+            
+            setOrder((o) => ({ ...o, status: newStatus, id: returnedId, vehicle_id: vehicleId }));
+            toast(`Order ${returnedId} confirmed with vehicle ${selectedVehicle.vehicle_number}`, "success");
+            
+            // Close modal and reset state
+            setVehicleModalOpen(false);
+            setSelectedVehicle(null);
+            setConfirmNotes("");
+            
         } catch (err) {
-            console.error("confirm err", err);
-            toast(err.message || "Failed to confirm", "error");
+            console.error("confirm order error", err);
+            toast(err.message || "Failed to confirm order", "error");
         } finally {
             setConfirming(false);
         }
@@ -1281,11 +1342,20 @@ export default function MasterOrdersMovementDetails() {
                             </div>
 
                             {/* Footer */}
-                            <div className="bg-gray-50 px-6 py-4 border-t border-gray-200">
+                            <div className="bg-gradient-to-r from-gray-50 to-gray-100 px-6 py-4 border-t border-gray-200">
                                 <div className="flex items-center justify-between">
                                     <div className="text-sm text-gray-700">
-                                        <div className="font-medium">Total Items: {editRows.length}</div>
-                                        <div className="text-lg font-bold text-green-600 mt-1">
+                                        <div className="flex items-center gap-4 mb-2">
+                                            <div className="flex items-center gap-2">
+                                                <FiShoppingCart className="w-4 h-4 text-gray-500" />
+                                                <span className="font-medium">Items: {editRows.length}</span>
+                                            </div>
+                                            <div className="flex items-center gap-2">
+                                                <FiPackage className="w-4 h-4 text-gray-500" />
+                                                <span className="font-medium">Total Qty: {editRows.reduce((s, r) => s + Number(r.qty || 0), 0)}</span>
+                                            </div>
+                                        </div>
+                                        <div className="text-xl font-bold bg-gradient-to-r from-green-600 to-emerald-600 bg-clip-text text-transparent">
                                             Preview Total: {fmtCurrency(editRows.reduce((s, r) => s + (Number(r.qty || 0) * Number(r.unit_price || 0)), 0))}
                                         </div>
                                     </div>
@@ -1293,26 +1363,32 @@ export default function MasterOrdersMovementDetails() {
                                         <button
                                             onClick={() => setEditOpen(false)}
                                             disabled={editSaving}
-                                            className="px-6 py-3 border border-gray-200 rounded-xl text-gray-700 hover:bg-gray-50 transition-colors duration-200"
+                                            className="flex items-center gap-2 px-6 py-3 border border-gray-300 rounded-xl text-gray-700 hover:bg-white hover:shadow-sm transition-all duration-200"
                                         >
+                                            <FiX className="w-4 h-4" />
                                             Cancel
                                         </button>
                                         <button
                                             onClick={submitEdit}
-                                            disabled={editSaving}
-                                            className={`px-6 py-3 rounded-xl font-medium transition-all duration-200 ${
-                                                editSaving 
+                                            disabled={editSaving || editRows.length === 0}
+                                            className={`flex items-center gap-2 px-6 py-3 rounded-xl font-medium transition-all duration-200 ${
+                                                editSaving || editRows.length === 0
                                                     ? "bg-gray-400 text-white cursor-not-allowed" 
                                                     : "bg-gradient-to-r from-blue-500 to-indigo-600 hover:from-blue-600 hover:to-indigo-700 text-white shadow-lg hover:shadow-xl"
                                             }`}
                                         >
                                             {editSaving ? (
                                                 <>
-                                                    <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin mr-2 inline-block"></div>
+                                                    <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
                                                     Saving...
                                                 </>
                                             ) : (
-                                                "Save Changes"
+                                                <>
+                                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                                                    </svg>
+                                                    Save Changes
+                                                </>
                                             )}
                                         </button>
                                     </div>
@@ -1322,6 +1398,230 @@ export default function MasterOrdersMovementDetails() {
                     </div>
                 )}
             </main>
+
+            {/* Vehicle Selection Modal */}
+            {vehicleModalOpen && (
+                <div className="fixed inset-0 z-70 flex items-center justify-center px-4 py-6">
+                    <div
+                        className="absolute inset-0 bg-black/50 backdrop-blur-sm"
+                        onClick={() => { if (!confirming) setVehicleModalOpen(false); }}
+                    />
+
+                    <div className="relative bg-white w-full max-w-4xl rounded-2xl shadow-2xl flex flex-col max-h-[80vh] overflow-hidden">
+                        {/* Header */}
+                        <div className="bg-gradient-to-r from-green-500 to-emerald-600 p-6">
+                            <div className="flex items-center justify-between">
+                                <div className="text-white">
+                                    <h3 className="text-xl font-semibold">Select Vehicle for Order Confirmation</h3>
+                                    <p className="text-green-100 mt-1">Order #{order.id} • Weight: {orderWeight}kg</p>
+                                </div>
+                                <button
+                                    onClick={() => { if (!confirming) setVehicleModalOpen(false); }}
+                                    disabled={confirming}
+                                    className="p-2 rounded-xl hover:bg-white/10 text-white transition-colors duration-200"
+                                >
+                                    <FiX className="w-6 h-6" />
+                                </button>
+                            </div>
+                        </div>
+
+                        {/* Body */}
+                        <div className="flex-1 overflow-y-auto p-6">
+                            {loadingVehicles ? (
+                                <div className="flex items-center justify-center py-12">
+                                    <div className="w-8 h-8 border-2 border-green-500 border-t-transparent rounded-full animate-spin mr-3"></div>
+                                    <span className="text-gray-600">Loading available vehicles...</span>
+                                </div>
+                            ) : vehicles.length === 0 ? (
+                                <div className="text-center py-12">
+                                    <div className="w-16 h-16 bg-gray-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                                        <FiTruck className="w-8 h-8 text-gray-400" />
+                                    </div>
+                                    <h3 className="text-lg font-medium text-gray-900 mb-2">No Vehicles Available</h3>
+                                    <p className="text-gray-500">No vehicles are currently available for delivery.</p>
+                                </div>
+                            ) : (
+                                <div className="space-y-4">
+                                    <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 mb-6">
+                                        <div className="flex items-center gap-3">
+                                            <div className="w-10 h-10 bg-blue-500 rounded-xl flex items-center justify-center">
+                                                <FiInfo className="w-5 h-5 text-white" />
+                                            </div>
+                                            <div>
+                                                <h4 className="font-semibold text-blue-900">Order Requirements</h4>
+                                                <p className="text-sm text-blue-700">
+                                                    Order weight: <span className="font-semibold">{orderWeight}kg</span> • 
+                                                    Select a vehicle with sufficient capacity
+                                                </p>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <div className="grid gap-4">
+                                        {vehicles.map((vehicle) => {
+                                            const isSelected = selectedVehicle?.id === vehicle.id;
+                                            const hasCapacity = vehicle.capacity_weight >= orderWeight;
+                                            const capacityPercentage = Math.min((orderWeight / vehicle.capacity_weight) * 100, 100);
+
+                                            return (
+                                                <div
+                                                    key={vehicle.id}
+                                                    onClick={() => hasCapacity && setSelectedVehicle(vehicle)}
+                                                    className={`border-2 rounded-xl p-5 cursor-pointer transition-all duration-200 ${
+                                                        isSelected 
+                                                            ? "border-green-500 bg-green-50 shadow-lg" 
+                                                            : hasCapacity 
+                                                                ? "border-gray-200 hover:border-green-300 hover:shadow-md" 
+                                                                : "border-red-200 bg-red-50 cursor-not-allowed opacity-60"
+                                                    }`}
+                                                >
+                                                    <div className="flex items-start justify-between">
+                                                        <div className="flex items-start gap-4">
+                                                            <div className={`w-12 h-12 rounded-xl flex items-center justify-center ${
+                                                                isSelected ? "bg-green-500" : hasCapacity ? "bg-blue-500" : "bg-red-500"
+                                                            }`}>
+                                                                <FiTruck className="w-6 h-6 text-white" />
+                                                            </div>
+                                                            <div>
+                                                                <h4 className="font-semibold text-lg text-gray-900">
+                                                                    {vehicle.vehicle_number}
+                                                                </h4>
+                                                                <div className="flex items-center gap-4 mt-1 text-sm text-gray-600">
+                                                                    <div className="flex items-center gap-1">
+                                                                        <FiPhone className="w-4 h-4" />
+                                                                        {vehicle.driver_mobile}
+                                                                    </div>
+                                                                    <div className="flex items-center gap-1">
+                                                                        <FiMapPin className="w-4 h-4" />
+                                                                        {vehicle.lat}, {vehicle.lng}
+                                                                    </div>
+                                                                </div>
+                                                                {vehicle.details && (
+                                                                    <p className="text-sm text-gray-500 mt-1">{vehicle.details}</p>
+                                                                )}
+                                                            </div>
+                                                        </div>
+
+                                                        <div className="text-right">
+                                                            <div className={`text-lg font-bold ${
+                                                                hasCapacity ? "text-green-600" : "text-red-600"
+                                                            }`}>
+                                                                {vehicle.capacity_weight} {vehicle.capacity_unit}
+                                                            </div>
+                                                            <div className="text-sm text-gray-500 mb-2">Capacity</div>
+                                                            
+                                                            {/* Capacity Bar */}
+                                                            <div className="w-32">
+                                                                <div className="flex justify-between text-xs text-gray-500 mb-1">
+                                                                    <span>Usage</span>
+                                                                    <span>{Math.round(capacityPercentage)}%</span>
+                                                                </div>
+                                                                <div className="w-full bg-gray-200 rounded-full h-2">
+                                                                    <div 
+                                                                        className={`h-2 rounded-full transition-all duration-300 ${
+                                                                            capacityPercentage > 100 
+                                                                                ? "bg-red-500" 
+                                                                                : capacityPercentage > 80 
+                                                                                    ? "bg-yellow-500" 
+                                                                                    : "bg-green-500"
+                                                                        }`}
+                                                                        style={{ width: `${Math.min(capacityPercentage, 100)}%` }}
+                                                                    />
+                                                                </div>
+                                                            </div>
+
+                                                            {!hasCapacity && (
+                                                                <div className="text-xs text-red-600 mt-1 font-medium">
+                                                                    Insufficient capacity
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    </div>
+
+                                                    {isSelected && (
+                                                        <div className="mt-4 pt-4 border-t border-green-200">
+                                                            <div className="flex items-center gap-2 text-green-700">
+                                                                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                                                                </svg>
+                                                                <span className="font-medium">Selected for delivery</span>
+                                                            </div>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
+
+                                    {/* Notes Section */}
+                                    {selectedVehicle && (
+                                        <div className="mt-6 p-4 bg-gray-50 rounded-xl">
+                                            <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                Delivery Notes (Optional)
+                                            </label>
+                                            <textarea
+                                                value={confirmNotes}
+                                                onChange={(e) => setConfirmNotes(e.target.value)}
+                                                placeholder="Add any special delivery instructions..."
+                                                className="w-full px-4 py-3 border border-gray-200 rounded-xl focus:ring-2 focus:ring-green-500 focus:border-green-500 resize-none"
+                                                rows={3}
+                                            />
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Footer */}
+                        <div className="bg-gray-50 px-6 py-4 border-t border-gray-200">
+                            <div className="flex items-center justify-between">
+                                <div className="text-sm text-gray-600">
+                                    {selectedVehicle ? (
+                                        <div className="flex items-center gap-2 text-green-600">
+                                            <FiTruck className="w-4 h-4" />
+                                            <span>Vehicle {selectedVehicle.vehicle_number} selected</span>
+                                        </div>
+                                    ) : (
+                                        <span>Please select a vehicle to continue</span>
+                                    )}
+                                </div>
+                                <div className="flex gap-3">
+                                    <button
+                                        onClick={() => setVehicleModalOpen(false)}
+                                        disabled={confirming}
+                                        className="px-6 py-3 border border-gray-300 rounded-xl text-gray-700 hover:bg-white hover:shadow-sm transition-all duration-200"
+                                    >
+                                        Cancel
+                                    </button>
+                                    <button
+                                        onClick={confirmOrderWithVehicle}
+                                        disabled={!selectedVehicle || confirming}
+                                        className={`px-6 py-3 rounded-xl font-medium transition-all duration-200 ${
+                                            !selectedVehicle || confirming
+                                                ? "bg-gray-400 text-white cursor-not-allowed"
+                                                : "bg-gradient-to-r from-green-500 to-emerald-600 hover:from-green-600 hover:to-emerald-700 text-white shadow-lg hover:shadow-xl"
+                                        }`}
+                                    >
+                                        {confirming ? (
+                                            <>
+                                                <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin mr-2 inline-block"></div>
+                                                Confirming Order...
+                                            </>
+                                        ) : (
+                                            <>
+                                                <svg className="w-4 h-4 mr-2 inline-block" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                                                </svg>
+                                                Confirm Order
+                                            </>
+                                        )}
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            )}
         </div>
     );
 }
